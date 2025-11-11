@@ -2,7 +2,7 @@ import json, torch, streamlit as st
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from huggingface_hub import hf_hub_download
 
-REPO_ID = "louai-phishing-distilbert-uncased-finetuned"  # <-- HF model repo id
+REPO_ID = "lwiz/louai-phishing-distilbert-uncased-finetuned"  # <-- HF model repo id
 
 @st.cache_resource
 def load_model():
