@@ -34,7 +34,7 @@ if st.button("Classify"):
     st.progress(min(1.0, prob))
 
 # -----------------------------
-# Gmail OAuth (final, hardened)
+# Gmail OAuth (diagnostic)
 # -----------------------------
 import urllib.parse
 from google_auth_oauthlib.flow import Flow
@@ -43,17 +43,14 @@ from google.oauth2.credentials import Credentials
 
 def _get_secret(key: str) -> str:
     v = st.secrets[key]
-    # Secrets editor sometimes preserves quotes/spaces — trim them:
     return str(v).strip().strip('"').strip("'")
 
 CLIENT_ID     = _get_secret("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = _get_secret("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI  = _get_secret("GOOGLE_REDIRECT_URI")  # e.g., https://phidetector.streamlit.app/
 
-# Normalize SCOPES to a Python list (accepts space- or comma-separated string too)
 _scopes_raw = st.secrets["SCOPES"]
 if isinstance(_scopes_raw, str):
-    # split on comma or whitespace
     parts = [p.strip() for chunk in _scopes_raw.split(",") for p in chunk.split()]
     SCOPES = [p for p in parts if p]
 else:
@@ -77,13 +74,20 @@ def build_flow() -> Flow:
 
 st.subheader("Connect Gmail (read-only)")
 
+# Show what we will send (for debugging)
+with st.expander("🔎 OAuth debug (what the app will send)"):
+    st.write("Redirect URI used by the app:")
+    st.code(REDIRECT_URI)
+    st.write("Scopes:")
+    st.code(SCOPES)
+
 # 1) Reuse creds if already in session
 creds = None
 if "creds_json" in st.session_state:
     creds = Credentials.from_authorized_user_info(st.session_state["creds_json"])
     st.session_state["token_exchanged"] = True
 
-# 2) Handle callback exactly once
+# 2) Handle callback once
 code  = st.query_params.get("code")
 state = st.query_params.get("state")
 
@@ -94,7 +98,7 @@ if code and not st.session_state.get("token_exchanged"):
         expected_state = st.session_state.get("oauth_state")
         if expected_state and expected_state != state:
             st.warning("OAuth state mismatch, restarting sign-in…")
-            st.query_params.clear()  # drop bad params and fall through to step 3
+            st.query_params.clear()
         else:
             flow.fetch_token(authorization_response=auth_resp)
             creds = flow.credentials
@@ -107,24 +111,29 @@ if code and not st.session_state.get("token_exchanged"):
                 "scopes": SCOPES,
             }
             st.session_state["token_exchanged"] = True
-            st.query_params.clear()  # prevent double redemption on rerun
+            st.query_params.clear()
     except Exception as e:
         st.error(f"OAuth error during token exchange: {e}")
         st.stop()
 
-# 3) If no creds, start the flow (IMPORTANT: booleans, not strings)
+# 3) No creds yet → start flow (booleans, not strings)
 if not creds:
     flow = build_flow()
     auth_url, oauth_state = flow.authorization_url(
-        access_type="offline",                  # boolean handled by library
-        include_granted_scopes=True,            # <- MUST be a boolean (not "true" or "True")
+        access_type="offline",
+        include_granted_scopes=True,   # boolean
         prompt="consent",
     )
     st.session_state["oauth_state"] = oauth_state
+
+    # Show the actual URL we send to Google
+    with st.expander("🔗 Authorization URL (exact)"):
+        st.code(auth_url)
+
     st.link_button("Sign in with Google", auth_url)
     st.stop()
 
-# 4) Have creds — call Gmail
+# 4) Call Gmail
 service = build("gmail", "v1", credentials=creds)
 st.success("Signed in to Gmail ✅")
 
