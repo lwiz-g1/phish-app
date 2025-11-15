@@ -1,6 +1,6 @@
 streamlit
-transformers==4.57.1
+transformers
 torch
 huggingface_hub
-google-api-python-client
 google-auth-oauthlib
+google-api-python-client
