@@ -74,12 +74,6 @@ def build_flow() -> Flow:
 
 st.subheader("Connect Gmail (read-only)")
 
-# Show what we will send (for debugging)
-with st.expander("🔎 OAuth debug (what the app will send)"):
-    st.write("Redirect URI used by the app:")
-    st.code(REDIRECT_URI)
-    st.write("Scopes:")
-    st.code(SCOPES)
 
 # 1) Reuse creds if already in session
 creds = None
@@ -126,9 +120,7 @@ if not creds:
     )
     st.session_state["oauth_state"] = oauth_state
 
-    # Show the actual URL we send to Google
-    with st.expander("🔗 Authorization URL (exact)"):
-        st.code(auth_url)
+    
 
     st.link_button("Sign in with Google", auth_url)
     st.stop()
