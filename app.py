@@ -18,7 +18,7 @@ def load_model():
     thr = json.load(open(thr_file))["threshold"]
     return tok, mdl, float(thr)
 
-st.title("Phishing Email Detector (DistilBERT)")
+st.title("Phishing Email Detector ")
 tok, mdl, thr = load_model()
 st.caption(f"Decision threshold: {thr:.2f}")
 
@@ -72,7 +72,7 @@ def build_flow() -> Flow:
     flow.redirect_uri = REDIRECT_URI
     return flow
 
-st.subheader("Connect Gmail (read-only)")
+st.subheader("Connect Gmail ")
 
 
 # 1) Reuse creds if already in session
