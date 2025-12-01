@@ -137,7 +137,7 @@ if not creds:
     flow = build_flow()
     auth_url, oauth_state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes=True,   # ← boolean True
+        include_granted_scopes="true",   # ← boolean True
         prompt="consent",
     )
     st.session_state["oauth_state"] = oauth_state
