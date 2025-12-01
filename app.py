@@ -1,6 +1,12 @@
-# -----------------------------
-# Phishing model (unchanged core, + threshold slider)
-# -----------------------------
+# ==============================
+# Phishing Email Detector (Streamlit)
+# - DistilBERT classifier
+# - Gmail OAuth (read-only)
+# - Threshold persistence + FP/FN logger
+# - Header-based trust tweak to reduce FPs
+# ==============================
+
+# ---------- Model ----------
 import json
 import torch
 import streamlit as st
@@ -19,17 +25,27 @@ def load_model():
     return tok, mdl, float(thr)
 
 st.title("Phishing Email Detector")
-tok, mdl, thr = load_model()
-st.caption(f"Saved decision threshold: {thr:.2f}")
 
-# NEW: safer, adjustable threshold for demo/testing
+tok, mdl, thr_saved = load_model()
+st.caption(f"Saved decision threshold (from training): {thr_saved:.2f}")
+
+# ----- Sticky UI threshold (defaults to 0.80 for fewer false alarms) -----
+default_thr = st.session_state.get("ui_threshold", 0.80)
 thr_ui = st.sidebar.slider(
     "Decision threshold",
-    0.10, 0.90, float(thr), 0.01,
-    help="Lower = catch more phishing (higher recall), Higher = fewer false alarms (higher precision)."
+    0.10, 0.95, float(default_thr), 0.01,
+    help="Higher threshold = fewer false positives (but more false negatives)",
 )
+st.session_state["ui_threshold"] = thr_ui
 
-txt = st.text_area("Paste email subject + body:", height=220)
+# Quick note when user runs very high/low values
+if thr_ui >= 0.85:
+    st.sidebar.info("High precision mode")
+elif thr_ui <= 0.40:
+    st.sidebar.warning("High recall mode")
+
+# ----- Paste-box demo -----
+txt = st.text_area("Paste email subject + body:", height=220, placeholder="Subject line\n\nBody text…")
 if st.button("Classify"):
     enc = tok(txt, truncation=True, padding=True, max_length=256, return_tensors="pt")
     with torch.no_grad():
@@ -37,28 +53,26 @@ if st.button("Classify"):
         prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
     label = "PHISHING" if prob >= thr_ui else "LEGIT"
     st.metric("Prediction", label)
-    st.json({"phishing_prob": prob, "threshold_used": thr_ui})
+    st.json({"model_prob": prob, "prob_after_header_rules": prob, "threshold_used": thr_ui})
     st.progress(min(1.0, prob))
 
-# -----------------------------
-# Gmail OAuth (hardened)
-# -----------------------------
+# ---------- Gmail OAuth ----------
 import urllib.parse
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 
 def _get_secret(key: str) -> str:
+    # IMPORTANT: edit in Streamlit Secrets, not here
     v = st.secrets[key]
-    # NEW: trim stray quotes/spaces from Secrets UI
     return str(v).strip().strip('"').strip("'")
 
-CLIENT_ID     = _get_secret("GOOGLE_CLIENT_ID")     # EDIT IN STREAMLIT SECRETS, NOT HERE
-CLIENT_SECRET = _get_secret("GOOGLE_CLIENT_SECRET") # EDIT IN STREAMLIT SECRETS, NOT HERE
-REDIRECT_URI  = _get_secret("GOOGLE_REDIRECT_URI")  # e.g., https://phidetector.streamlit.app/
-_scopes_raw   = st.secrets["SCOPES"]                # e.g., "https://www.googleapis.com/auth/gmail.readonly"
+CLIENT_ID     = _get_secret("GOOGLE_CLIENT_ID")      # secrets
+CLIENT_SECRET = _get_secret("GOOGLE_CLIENT_SECRET")  # secrets
+REDIRECT_URI  = _get_secret("GOOGLE_REDIRECT_URI")   # e.g., https://phidetector.streamlit.app/
+_scopes_raw   = st.secrets["SCOPES"]                 # "https://www.googleapis.com/auth/gmail.readonly"
 
-# Normalize scopes (string → list)
+# Normalize SCOPES to a list
 if isinstance(_scopes_raw, str):
     parts = [p.strip() for chunk in _scopes_raw.split(",") for p in chunk.split()]
     SCOPES = [p for p in parts if p]
@@ -83,18 +97,17 @@ def build_flow() -> Flow:
 
 st.subheader("Connect Gmail (read-only)")
 
-# 1) Reuse creds if already in session
+# Reuse creds if session has them
 creds = None
 if "creds_json" in st.session_state:
     creds = Credentials.from_authorized_user_info(st.session_state["creds_json"])
-    st.session_state["token_exchanged"] = True  # NEW: never try to redeem again in this session
+    st.session_state["token_exchanged"] = True
 
-# 2) Handle callback exactly once
+# Handle callback once
 code  = st.query_params.get("code")
 state = st.query_params.get("state")
 
 if code and not st.session_state.get("token_exchanged"):
-    # NEW: build the exact authorization_response Google called with
     auth_resp = REDIRECT_URI + "?" + urllib.parse.urlencode({k: v for k, v in st.query_params.items()})
     try:
         flow = build_flow()
@@ -103,7 +116,7 @@ if code and not st.session_state.get("token_exchanged"):
             st.warning("OAuth state mismatch, restarting sign-in…")
             st.query_params.clear()
         else:
-            flow.fetch_token(authorization_response=auth_resp)  # redeem ONCE
+            flow.fetch_token(authorization_response=auth_resp)
             creds = flow.credentials
             st.session_state["creds_json"] = {
                 "token": creds.token,
@@ -114,22 +127,21 @@ if code and not st.session_state.get("token_exchanged"):
                 "scopes": SCOPES,
             }
             st.session_state["token_exchanged"] = True
-            st.query_params.clear()  # NEW: prevent double redemption on rerun
+            st.query_params.clear()
     except Exception as e:
         st.error(f"OAuth error during token exchange: {e}")
         st.stop()
 
-# 3) No creds yet → start flow (IMPORTANT: booleans, not strings)
+# Start flow (same-tab link)
 if not creds:
     flow = build_flow()
     auth_url, oauth_state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",   # NEW: boolean True (not "true")
+        include_granted_scopes=True,   # ← boolean True
         prompt="consent",
     )
     st.session_state["oauth_state"] = oauth_state
 
-    # NEW: same-tab link (avoids opening a new window)
     st.markdown(
         f'<a href="{auth_url}" style="display:inline-block;padding:0.6rem 1rem;'
         'background:#0e5ef7;color:white;border-radius:0.5rem;text-decoration:none;">'
@@ -138,11 +150,8 @@ if not creds:
     )
     st.stop()
 
-# -----------------------------
-# Gmail helpers — complete body extraction
-# -----------------------------
-# NEW: robust HTML→text extraction to avoid "incomplete emails"
-import base64, html
+# ---------- Gmail helpers (complete body extraction) ----------
+import base64, html, io, csv, requests
 from bs4 import BeautifulSoup
 
 def _decode_b64url(data: str) -> str:
@@ -152,7 +161,7 @@ def _decode_b64url(data: str) -> str:
         return ""
 
 def extract_text_from_payload(payload: dict) -> str:
-    """Walk Gmail MIME tree. Prefer text/plain; fallback to stripped HTML."""
+    """Prefer text/plain; fallback to stripped HTML; walk MIME tree."""
     texts_plain, texts_html = [], []
 
     def walk(p):
@@ -173,14 +182,10 @@ def extract_text_from_payload(payload: dict) -> str:
                 texts_html.append(BeautifulSoup(raw, "html.parser").get_text(" ", strip=True))
 
     walk(payload)
-
-    # prefer plain text
     text = "\n\n".join([t.strip() for t in texts_plain if t.strip()])
     if not text:
         text = "\n\n".join([t.strip() for t in texts_html if t.strip()])
-    # normalize whitespace; keep reasonable length (model sees 256 tokens max)
-    text = " ".join(text.split())
-    return text
+    return " ".join(text.split())
 
 def header_get(payload: dict, name: str, default=""):
     for h in payload.get("headers", []):
@@ -188,14 +193,49 @@ def header_get(payload: dict, name: str, default=""):
             return h.get("value", default)
     return default
 
-# -----------------------------
-# Signed in → list & classify messages
-# -----------------------------
+# ---------- Small FP reduction: trusted-sender header boost ----------
+TRUSTED_DOMAINS = {
+    "github.com", "google.com", "paypal.com", "microsoft.com",
+    "apple.com", "googlemail.com", "amazon.com"
+}
+
+def header_trust_boost(headers: dict) -> float:
+    """If SPF/DKIM pass AND From is a trusted domain, subtract 0.20 from prob."""
+    auth = (headers.get("Authentication-Results", "") + " " + headers.get("Received-SPF", "")).lower()
+    from_addr = headers.get("From", "").lower()
+    has_pass = ("spf=pass" in auth) or ("dkim=pass" in auth)
+    trusted  = any(d in from_addr for d in TRUSTED_DOMAINS)
+    return -0.20 if (has_pass and trusted) else 0.0
+
+# ---------- FP/FN logger ----------
+if "label_log" not in st.session_state:
+    st.session_state["label_log"] = []  # list of dicts
+
+def log_example(example_id: str, text: str, model_prob: float, prob_adj: float, used_thr: float, predicted: str, true_label: str):
+    st.session_state["label_log"].append({
+        "id": example_id,
+        "text": text[:4000],           # keep CSV manageable
+        "model_prob": round(model_prob, 4),
+        "prob_after_rules": round(prob_adj, 4),
+        "threshold_used": round(used_thr, 2),
+        "predicted": predicted,
+        "true_label": true_label,      # "FP" (should be LEGIT) or "FN" (should be PHISHING)
+    })
+
+def download_log_button():
+    if not st.session_state["label_log"]:
+        return
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(st.session_state["label_log"][0].keys()))
+    writer.writeheader()
+    writer.writerows(st.session_state["label_log"])
+    st.download_button("Download FP/FN log (CSV)", buf.getvalue(), "label_log.csv", "text/csv")
+
+# ---------- Signed in → list & classify ----------
 service = build("gmail", "v1", credentials=creds)
 st.success("Signed in to Gmail ✅")
 
-# NEW: sidebar sign-out / clear session
-import requests
+# Sign out / revoke
 def sign_out():
     try:
         token = st.session_state.get("creds_json", {}).get("token")
@@ -208,16 +248,16 @@ def sign_out():
             )
     except Exception:
         pass
-    st.session_state.pop("creds_json", None)
-    st.session_state.pop("token_exchanged", None)
-    st.session_state.pop("oauth_state", None)
+    for k in ("creds_json", "token_exchanged", "oauth_state"):
+        st.session_state.pop(k, None)
     st.query_params.clear()
     st.success("Signed out.")
     st.stop()
 
 st.sidebar.button("Sign out / Clear session", on_click=sign_out)
+download_log_button()
 
-# Fetch last 10 messages and show complete text (subject + extracted body)
+# Fetch last 10 messages
 resp = service.users().messages().list(userId="me", q="newer_than:7d", maxResults=10).execute()
 msgs = resp.get("messages", [])
 if not msgs:
@@ -227,6 +267,8 @@ else:
     for m in msgs:
         full = service.users().messages().get(userId="me", id=m["id"], format="full").execute()
         payload = full.get("payload", {}) or {}
+        headers_list = payload.get("headers", []) or []
+        headers = {h.get("name",""): h.get("value","") for h in headers_list}
 
         subject = header_get(payload, "Subject", "(no subject)")
         sender  = header_get(payload, "From", "(unknown)")
@@ -239,13 +281,30 @@ else:
         st.write(f"From: {sender}")
         st.write(preview if preview else "(no content)")
 
-        # NEW: classify this message using the same model + adjustable threshold
+        # ---- Classify with optional header-based trust tweak ----
         if st.button(f"Classify this #{m['id']}", key=m["id"]):
             enc = tok(display_text, truncation=True, padding=True, max_length=256, return_tensors="pt")
             with torch.no_grad():
                 out = mdl(**enc)
                 prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
-            label = "PHISHING" if prob >= thr_ui else "LEGIT"
-            st.info(f"{label}  (p={prob:.3f}, threshold_used={thr_ui:.2f})")
+
+            prob_adj = min(max(prob + header_trust_boost(headers), 0.0), 1.0)
+            label = "PHISHING" if prob_adj >= thr_ui else "LEGIT"
+
+            st.info(f"{label}  (model_prob={prob:.3f}, prob_after_rules={prob_adj:.3f}, threshold_used={thr_ui:.2f})")
+            st.json({"model_prob": prob, "prob_after_header_rules": prob_adj, "threshold": thr_ui})
+
+            # Quick feedback buttons to build your re-train set
+            cols = st.columns(3)
+            with cols[0]:
+                if st.button("Mark as FALSE POSITIVE (should be LEGIT)", key=m["id"]+"_fp"):
+                    log_example(m["id"], display_text, prob, prob_adj, thr_ui, label, "FP")
+                    st.success("Logged as FP")
+            with cols[1]:
+                if st.button("Mark as FALSE NEGATIVE (should be PHISHING)", key=m["id"]+"_fn"):
+                    log_example(m["id"], display_text, prob, prob_adj, thr_ui, label, "FN")
+                    st.success("Logged as FN")
+            with cols[2]:
+                download_log_button()
 
         st.divider()
