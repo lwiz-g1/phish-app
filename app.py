@@ -27,7 +27,6 @@ def load_model():
 st.title("Phishing Email Detector")
 
 tok, mdl, thr_saved = load_model()
-st.caption(f"Saved decision threshold (from training): {thr_saved:.2f}")
 
 # ----- Sticky UI threshold (defaults to 0.80 for fewer false alarms) -----
 default_thr = st.session_state.get("ui_threshold", 0.80)
