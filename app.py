@@ -6,19 +6,34 @@
 # - Header-based trust tweak to reduce FPs
 # ==============================
 
-# ---------- Model ----------
+# ---------- Imports ----------
 import json
+import re
+import base64
+import html
+import io
+import csv
+import requests
+import urllib.parse
+from urllib.parse import urlparse
+
 import torch
 import streamlit as st
-import re
-import base64, html, io, csv, requests
-from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from huggingface_hub import hf_hub_download
 
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+
+
+# ---------- Model ----------
 REPO_ID = "lwiz/louai-phishing-distilbert-uncased-finetuned"
+
+
 # ====== (B) Helper functions for better email text extraction & structured model input ======
+# NOTE: These helpers are added now, but NOT used yet (we will apply them in the next step).
 
 URL_RE = re.compile(r"(https?://[^\s<>\"]+|www\.[^\s<>\"]+)", re.IGNORECASE)
 
@@ -127,7 +142,8 @@ def build_model_input(subject: str, from_: str, reply_to: str, body_text: str, u
         f"[BODY] {body_text.strip() if body_text else ''}",
     ]
     return "\n".join(parts).strip()
-======================
+
+
 @st.cache_resource
 def load_model():
     tok = AutoTokenizer.from_pretrained(REPO_ID)
@@ -168,12 +184,8 @@ if st.button("Classify"):
     st.json({"model_prob": prob, "prob_after_header_rules": prob, "threshold_used": thr_ui})
     st.progress(min(1.0, prob))
 
-# ---------- Gmail OAuth ----------
-import urllib.parse
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
 
+# ---------- Gmail OAuth ----------
 def _get_secret(key: str) -> str:
     # IMPORTANT: edit in Streamlit Secrets, not here
     v = st.secrets[key]
@@ -249,7 +261,7 @@ if not creds:
     flow = build_flow()
     auth_url, oauth_state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",   # ← boolean True
+        include_granted_scopes="true",
         prompt="consent",
     )
     st.session_state["oauth_state"] = oauth_state
@@ -262,10 +274,8 @@ if not creds:
     )
     st.stop()
 
-# ---------- Gmail helpers (complete body extraction) ----------
-import base64, html, io, csv, requests
-from bs4 import BeautifulSoup
 
+# ---------- Gmail helpers (your original extraction - unchanged for now) ----------
 def _decode_b64url(data: str) -> str:
     try:
         return base64.urlsafe_b64decode(data.encode("utf-8")).decode(errors="ignore")
@@ -305,6 +315,7 @@ def header_get(payload: dict, name: str, default=""):
             return h.get("value", default)
     return default
 
+
 # ---------- Small FP reduction: trusted-sender header boost ----------
 TRUSTED_DOMAINS = {
     "github.com", "google.com", "paypal.com", "microsoft.com",
@@ -318,6 +329,7 @@ def header_trust_boost(headers: dict) -> float:
     has_pass = ("spf=pass" in auth) or ("dkim=pass" in auth)
     trusted  = any(d in from_addr for d in TRUSTED_DOMAINS)
     return -0.20 if (has_pass and trusted) else 0.0
+
 
 # ---------- FP/FN logger ----------
 if "label_log" not in st.session_state:
@@ -342,6 +354,7 @@ def download_log_button():
     writer.writeheader()
     writer.writerows(st.session_state["label_log"])
     st.download_button("Download FP/FN log (CSV)", buf.getvalue(), "label_log.csv", "text/csv")
+
 
 # ---------- Signed in → list & classify ----------
 service = build("gmail", "v1", credentials=creds)
