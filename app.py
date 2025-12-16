@@ -33,7 +33,6 @@ REPO_ID = "lwiz/louai-phishing-distilbert-uncased-finetuned"
 
 
 # ====== (B) Helper functions for better email text extraction & structured model input ======
-# NOTE: These helpers are added now, but NOT used yet (we will apply them in the next step).
 
 URL_RE = re.compile(r"(https?://[^\s<>\"]+|www\.[^\s<>\"]+)", re.IGNORECASE)
 
@@ -175,7 +174,14 @@ elif thr_ui <= 0.40:
 # ----- Paste-box demo -----
 txt = st.text_area("Paste email subject + body:", height=220, placeholder="Subject line\n\nBody text…")
 if st.button("Classify"):
-    enc = tok(txt, truncation=True, padding=True, max_length=256, return_tensors="pt")
+    model_txt = build_model_input(
+        subject="(manual input)",
+        from_="",
+        reply_to="",
+        body_text=txt,
+        urls=extract_urls_from_text(txt),
+    )
+    enc = tok(model_txt, truncation=True, padding=True, max_length=384, return_tensors="pt")
     with torch.no_grad():
         out = mdl(**enc)
         prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
@@ -275,7 +281,7 @@ if not creds:
     st.stop()
 
 
-# ---------- Gmail helpers (your original extraction - unchanged for now) ----------
+# ---------- Gmail helpers (kept for UI display headers fallback) ----------
 def _decode_b64url(data: str) -> str:
     try:
         return base64.urlsafe_b64decode(data.encode("utf-8")).decode(errors="ignore")
@@ -314,6 +320,37 @@ def header_get(payload: dict, name: str, default=""):
         if h.get("name", "").lower() == name.lower():
             return h.get("value", default)
     return default
+
+
+def extract_email_features_from_gmail_message(full_msg: dict) -> dict:
+    """
+    Extract subject/from/reply-to + full text + urls using the (B) helpers.
+    """
+    payload = full_msg.get("payload") or {}
+    headers_list = payload.get("headers") or []
+
+    subject = get_header(headers_list, "Subject") or "(no subject)"
+    from_ = get_header(headers_list, "From") or "(unknown)"
+    reply_to = get_header(headers_list, "Reply-To") or ""
+
+    plain_text, html_text = extract_all_text_parts(payload)
+
+    if plain_text:
+        body = " ".join(plain_text.split())
+        urls = extract_urls_from_text(plain_text)
+    else:
+        body = clean_html_to_visible_text(html_text)
+        urls = extract_urls_from_html(html_text)
+
+    body = body[:6000]
+
+    return {
+        "subject": subject,
+        "from": from_,
+        "reply_to": reply_to,
+        "body": body,
+        "urls": urls,
+    }
 
 
 # ---------- Small FP reduction: trusted-sender header boost ----------
@@ -395,12 +432,22 @@ else:
         headers_list = payload.get("headers", []) or []
         headers = {h.get("name",""): h.get("value","") for h in headers_list}
 
-        subject = header_get(payload, "Subject", "(no subject)")
-        sender  = header_get(payload, "From", "(unknown)")
-        body_text = extract_text_from_payload(payload)
+        features = extract_email_features_from_gmail_message(full)
+
+        subject = features["subject"]
+        sender = features["from"]
+        body_text = features["body"]
+        urls = features["urls"]
 
         preview = (body_text[:800] + ("…" if len(body_text) > 800 else "")) if body_text else full.get("snippet","")
-        display_text = f"{subject}\n\n{preview}".strip()
+
+        display_text = build_model_input(
+            subject=subject,
+            from_=sender,
+            reply_to=features["reply_to"],
+            body_text=body_text,
+            urls=urls,
+        )
 
         st.write(f"**{subject}**")
         st.write(f"From: {sender}")
@@ -408,7 +455,7 @@ else:
 
         # ---- Classify with optional header-based trust tweak ----
         if st.button(f"Classify this #{m['id']}", key=m["id"]):
-            enc = tok(display_text, truncation=True, padding=True, max_length=256, return_tensors="pt")
+            enc = tok(display_text, truncation=True, padding=True, max_length=384, return_tensors="pt")
             with torch.no_grad():
                 out = mdl(**enc)
                 prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
