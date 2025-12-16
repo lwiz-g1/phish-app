@@ -10,11 +10,124 @@
 import json
 import torch
 import streamlit as st
+import re
+import base64, html, io, csv, requests
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from huggingface_hub import hf_hub_download
 
 REPO_ID = "lwiz/louai-phishing-distilbert-uncased-finetuned"
+# ====== (B) Helper functions for better email text extraction & structured model input ======
 
+URL_RE = re.compile(r"(https?://[^\s<>\"]+|www\.[^\s<>\"]+)", re.IGNORECASE)
+
+def _b64url_decode(data: str) -> str:
+    if not data:
+        return ""
+    try:
+        return base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+def extract_all_text_parts(payload: dict) -> tuple[str, str]:
+    """
+    Returns (plain_text, html_text) aggregated from ALL nested MIME parts.
+    """
+    plain_chunks, html_chunks = [], []
+
+    def walk(part: dict):
+        if not isinstance(part, dict):
+            return
+
+        mime = (part.get("mimeType") or "").lower()
+        body = part.get("body") or {}
+        data = body.get("data")
+
+        if data:
+            decoded = _b64url_decode(data)
+            if "text/plain" in mime:
+                plain_chunks.append(decoded)
+            elif "text/html" in mime:
+                html_chunks.append(decoded)
+
+        for sub in part.get("parts", []) or []:
+            walk(sub)
+
+    walk(payload or {})
+    return "\n".join(plain_chunks).strip(), "\n".join(html_chunks).strip()
+
+def extract_urls_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    urls = URL_RE.findall(text)
+
+    norm = []
+    for u in urls:
+        if u.lower().startswith("www."):
+            norm.append("http://" + u)
+        else:
+            norm.append(u)
+
+    seen, out = set(), []
+    for u in norm:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def extract_urls_from_html(html_text: str) -> list[str]:
+    if not html_text:
+        return []
+    soup = BeautifulSoup(html_text, "lxml")
+
+    urls = []
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if href:
+            urls.append(href)
+
+    urls.extend(extract_urls_from_text(html_text))
+
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def clean_html_to_visible_text(html_text: str) -> str:
+    if not html_text:
+        return ""
+    soup = BeautifulSoup(html_text, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text(separator=" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
+
+def get_header(headers: list[dict], name: str) -> str:
+    if not headers:
+        return ""
+    name_l = name.lower()
+    for h in headers:
+        if (h.get("name") or "").lower() == name_l:
+            return (h.get("value") or "").strip()
+    return ""
+
+def build_model_input(subject: str, from_: str, reply_to: str, body_text: str, urls: list[str]) -> str:
+    """
+    Produces a consistent structured input string for the classifier.
+    """
+    urls_line = " | ".join((urls or [])[:15])
+    parts = [
+        f"[SUBJECT] {subject.strip() if subject else ''}",
+        f"[FROM] {from_.strip() if from_ else ''}",
+        f"[REPLY-TO] {reply_to.strip() if reply_to else ''}",
+        f"[URLS] {urls_line}",
+        f"[BODY] {body_text.strip() if body_text else ''}",
+    ]
+    return "\n".join(parts).strip()
+======================
 @st.cache_resource
 def load_model():
     tok = AutoTokenizer.from_pretrained(REPO_ID)
