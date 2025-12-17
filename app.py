@@ -2,6 +2,7 @@
 # Phishing Email Detector (Streamlit)
 # - DistilBERT classifier
 # - Gmail OAuth (read-only)
+# - Two-threshold triage (LEGIT / SUSPICIOUS / PHISHING)
 # - Threshold persistence + FP/FN logger
 # - Header-based trust tweak to reduce FPs
 # ==============================
@@ -32,7 +33,7 @@ from google.oauth2.credentials import Credentials
 REPO_ID = "lwiz/louai-phishing-distilbert-uncased-finetuned"
 
 
-# ====== (B) Helper functions for better email text extraction & structured model input ======
+# ====== Helpers for better email text extraction & structured model input ======
 
 URL_RE = re.compile(r"(https?://[^\s<>\"]+|www\.[^\s<>\"]+)", re.IGNORECASE)
 
@@ -142,6 +143,13 @@ def build_model_input(subject: str, from_: str, reply_to: str, body_text: str, u
     ]
     return "\n".join(parts).strip()
 
+def triage_label(prob: float, low: float, high: float) -> str:
+    if prob >= high:
+        return "PHISHING"
+    if prob < low:
+        return "LEGIT"
+    return "SUSPICIOUS"
+
 
 @st.cache_resource
 def load_model():
@@ -156,20 +164,37 @@ st.title("Phishing Email Detector")
 
 tok, mdl, thr_saved = load_model()
 
-# ----- Sticky UI threshold (defaults to 0.80 for fewer false alarms) -----
-default_thr = st.session_state.get("ui_threshold", 0.80)
-thr_ui = st.sidebar.slider(
-    "Decision threshold",
-    0.10, 0.95, float(default_thr), 0.01,
-    help="Higher threshold = fewer false positives (but more false negatives)",
-)
-st.session_state["ui_threshold"] = thr_ui
 
-# Quick note when user runs very high/low values
-if thr_ui >= 0.85:
-    st.sidebar.info("High precision mode")
-elif thr_ui <= 0.40:
-    st.sidebar.warning("High recall mode")
+# ---------- Two-threshold triage UI ----------
+st.sidebar.subheader("Decision thresholds (triage)")
+
+default_low  = st.session_state.get("thr_low", 0.45)
+default_high = st.session_state.get("thr_high", 0.80)
+
+thr_low = st.sidebar.slider(
+    "Legitimate if prob <",
+    0.05, 0.90, float(default_low), 0.01,
+    help="Below this = LEGIT."
+)
+
+thr_high = st.sidebar.slider(
+    "Phishing if prob ≥",
+    0.10, 0.95, float(default_high), 0.01,
+    help="At/above this = PHISHING."
+)
+
+if thr_high <= thr_low:
+    st.sidebar.error("Make sure: Phishing threshold > Legitimate threshold.")
+    st.stop()
+
+st.session_state["thr_low"] = thr_low
+st.session_state["thr_high"] = thr_high
+
+if thr_low <= 0.35:
+    st.sidebar.warning("High recall: fewer emails are marked LEGIT.")
+if thr_high >= 0.85:
+    st.sidebar.info("High precision: fewer emails are marked PHISHING.")
+
 
 # ----- Paste-box demo -----
 txt = st.text_area("Paste email subject + body:", height=220, placeholder="Subject line\n\nBody text…")
@@ -185,24 +210,28 @@ if st.button("Classify"):
     with torch.no_grad():
         out = mdl(**enc)
         prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
-    label = "PHISHING" if prob >= thr_ui else "LEGIT"
+
+    label = triage_label(prob, thr_low, thr_high)
+
     st.metric("Prediction", label)
-    st.json({"model_prob": prob, "prob_after_header_rules": prob, "threshold_used": thr_ui})
+    st.json({
+        "model_prob": prob,
+        "threshold_low": thr_low,
+        "threshold_high": thr_high,
+    })
     st.progress(min(1.0, prob))
 
 
 # ---------- Gmail OAuth ----------
 def _get_secret(key: str) -> str:
-    # IMPORTANT: edit in Streamlit Secrets, not here
     v = st.secrets[key]
     return str(v).strip().strip('"').strip("'")
 
-CLIENT_ID     = _get_secret("GOOGLE_CLIENT_ID")      # secrets
-CLIENT_SECRET = _get_secret("GOOGLE_CLIENT_SECRET")  # secrets
-REDIRECT_URI  = _get_secret("GOOGLE_REDIRECT_URI")   # e.g., https://phidetector.streamlit.app/
-_scopes_raw   = st.secrets["SCOPES"]                 # "https://www.googleapis.com/auth/gmail.readonly"
+CLIENT_ID     = _get_secret("GOOGLE_CLIENT_ID")
+CLIENT_SECRET = _get_secret("GOOGLE_CLIENT_SECRET")
+REDIRECT_URI  = _get_secret("GOOGLE_CLIENT_REDIRECT_URI") if "GOOGLE_CLIENT_REDIRECT_URI" in st.secrets else _get_secret("GOOGLE_REDIRECT_URI")
+_scopes_raw   = st.secrets["SCOPES"]
 
-# Normalize SCOPES to a list
 if isinstance(_scopes_raw, str):
     parts = [p.strip() for chunk in _scopes_raw.split(",") for p in chunk.split()]
     SCOPES = [p for p in parts if p]
@@ -227,13 +256,11 @@ def build_flow() -> Flow:
 
 st.subheader("Connect Gmail (read-only)")
 
-# Reuse creds if session has them
 creds = None
 if "creds_json" in st.session_state:
     creds = Credentials.from_authorized_user_info(st.session_state["creds_json"])
     st.session_state["token_exchanged"] = True
 
-# Handle callback once
 code  = st.query_params.get("code")
 state = st.query_params.get("state")
 
@@ -262,7 +289,6 @@ if code and not st.session_state.get("token_exchanged"):
         st.error(f"OAuth error during token exchange: {e}")
         st.stop()
 
-# Start flow (same-tab link)
 if not creds:
     flow = build_flow()
     auth_url, oauth_state = flow.authorization_url(
@@ -281,51 +307,8 @@ if not creds:
     st.stop()
 
 
-# ---------- Gmail helpers (kept for UI display headers fallback) ----------
-def _decode_b64url(data: str) -> str:
-    try:
-        return base64.urlsafe_b64decode(data.encode("utf-8")).decode(errors="ignore")
-    except Exception:
-        return ""
-
-def extract_text_from_payload(payload: dict) -> str:
-    """Prefer text/plain; fallback to stripped HTML; walk MIME tree."""
-    texts_plain, texts_html = [], []
-
-    def walk(p):
-        if not isinstance(p, dict):
-            return
-        if "parts" in p:
-            for sp in p.get("parts", []):
-                walk(sp)
-        else:
-            mime = p.get("mimeType", "") or ""
-            data = (p.get("body", {}) or {}).get("data")
-            if not data:
-                return
-            raw = _decode_b64url(data)
-            if "text/plain" in mime:
-                texts_plain.append(html.unescape(raw))
-            elif "text/html" in mime:
-                texts_html.append(BeautifulSoup(raw, "html.parser").get_text(" ", strip=True))
-
-    walk(payload)
-    text = "\n\n".join([t.strip() for t in texts_plain if t.strip()])
-    if not text:
-        text = "\n\n".join([t.strip() for t in texts_html if t.strip()])
-    return " ".join(text.split())
-
-def header_get(payload: dict, name: str, default=""):
-    for h in payload.get("headers", []):
-        if h.get("name", "").lower() == name.lower():
-            return h.get("value", default)
-    return default
-
-
+# ---------- Gmail helpers for structured extraction ----------
 def extract_email_features_from_gmail_message(full_msg: dict) -> dict:
-    """
-    Extract subject/from/reply-to + full text + urls using the (B) helpers.
-    """
     payload = full_msg.get("payload") or {}
     headers_list = payload.get("headers") or []
 
@@ -344,13 +327,7 @@ def extract_email_features_from_gmail_message(full_msg: dict) -> dict:
 
     body = body[:6000]
 
-    return {
-        "subject": subject,
-        "from": from_,
-        "reply_to": reply_to,
-        "body": body,
-        "urls": urls,
-    }
+    return {"subject": subject, "from": from_, "reply_to": reply_to, "body": body, "urls": urls}
 
 
 # ---------- Small FP reduction: trusted-sender header boost ----------
@@ -360,7 +337,6 @@ TRUSTED_DOMAINS = {
 }
 
 def header_trust_boost(headers: dict) -> float:
-    """If SPF/DKIM pass AND From is a trusted domain, subtract 0.20 from prob."""
     auth = (headers.get("Authentication-Results", "") + " " + headers.get("Received-SPF", "")).lower()
     from_addr = headers.get("From", "").lower()
     has_pass = ("spf=pass" in auth) or ("dkim=pass" in auth)
@@ -370,17 +346,18 @@ def header_trust_boost(headers: dict) -> float:
 
 # ---------- FP/FN logger ----------
 if "label_log" not in st.session_state:
-    st.session_state["label_log"] = []  # list of dicts
+    st.session_state["label_log"] = []
 
-def log_example(example_id: str, text: str, model_prob: float, prob_adj: float, used_thr: float, predicted: str, true_label: str):
+def log_example(example_id: str, text: str, model_prob: float, prob_adj: float, low: float, high: float, predicted: str, true_label: str):
     st.session_state["label_log"].append({
         "id": example_id,
-        "text": text[:4000],           # keep CSV manageable
+        "text": text[:4000],
         "model_prob": round(model_prob, 4),
         "prob_after_rules": round(prob_adj, 4),
-        "threshold_used": round(used_thr, 2),
+        "thr_low": round(low, 2),
+        "thr_high": round(high, 2),
         "predicted": predicted,
-        "true_label": true_label,      # "FP" (should be LEGIT) or "FN" (should be PHISHING)
+        "true_label": true_label,
     })
 
 def download_log_button():
@@ -397,7 +374,6 @@ def download_log_button():
 service = build("gmail", "v1", credentials=creds)
 st.success("Signed in to Gmail ✅")
 
-# Sign out / revoke
 def sign_out():
     try:
         token = st.session_state.get("creds_json", {}).get("token")
@@ -419,7 +395,6 @@ def sign_out():
 st.sidebar.button("Sign out / Clear session", on_click=sign_out)
 download_log_button()
 
-# Fetch last 10 messages
 resp = service.users().messages().list(userId="me", q="newer_than:7d", maxResults=10).execute()
 msgs = resp.get("messages", [])
 if not msgs:
@@ -430,7 +405,7 @@ else:
         full = service.users().messages().get(userId="me", id=m["id"], format="full").execute()
         payload = full.get("payload", {}) or {}
         headers_list = payload.get("headers", []) or []
-        headers = {h.get("name",""): h.get("value","") for h in headers_list}
+        headers = {h.get("name", ""): h.get("value", "") for h in headers_list}
 
         features = extract_email_features_from_gmail_message(full)
 
@@ -439,7 +414,7 @@ else:
         body_text = features["body"]
         urls = features["urls"]
 
-        preview = (body_text[:800] + ("…" if len(body_text) > 800 else "")) if body_text else full.get("snippet","")
+        preview = (body_text[:800] + ("…" if len(body_text) > 800 else "")) if body_text else full.get("snippet", "")
 
         display_text = build_model_input(
             subject=subject,
@@ -453,7 +428,6 @@ else:
         st.write(f"From: {sender}")
         st.write(preview if preview else "(no content)")
 
-        # ---- Classify with optional header-based trust tweak ----
         if st.button(f"Classify this #{m['id']}", key=m["id"]):
             enc = tok(display_text, truncation=True, padding=True, max_length=384, return_tensors="pt")
             with torch.no_grad():
@@ -461,22 +435,29 @@ else:
                 prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
 
             prob_adj = min(max(prob + header_trust_boost(headers), 0.0), 1.0)
-            label = "PHISHING" if prob_adj >= thr_ui else "LEGIT"
+            label = triage_label(prob_adj, thr_low, thr_high)
 
-            st.info(f"{label}  (model_prob={prob:.3f}, prob_after_rules={prob_adj:.3f}, threshold_used={thr_ui:.2f})")
-            st.json({"model_prob": prob, "prob_after_header_rules": prob_adj, "threshold": thr_ui})
+            st.info(f"{label} (model_prob={prob:.3f}, prob_after_rules={prob_adj:.3f}, low={thr_low:.2f}, high={thr_high:.2f})")
+            st.json({
+                "model_prob": prob,
+                "prob_after_header_rules": prob_adj,
+                "threshold_low": thr_low,
+                "threshold_high": thr_high,
+            })
 
-            # Quick feedback buttons to build your re-train set
-            cols = st.columns(3)
-            with cols[0]:
-                if st.button("Mark as FALSE POSITIVE (should be LEGIT)", key=m["id"]+"_fp"):
-                    log_example(m["id"], display_text, prob, prob_adj, thr_ui, label, "FP")
-                    st.success("Logged as FP")
-            with cols[1]:
-                if st.button("Mark as FALSE NEGATIVE (should be PHISHING)", key=m["id"]+"_fn"):
-                    log_example(m["id"], display_text, prob, prob_adj, thr_ui, label, "FN")
-                    st.success("Logged as FN")
-            with cols[2]:
-                download_log_button()
+            if label in ("PHISHING", "LEGIT"):
+                cols = st.columns(3)
+                with cols[0]:
+                    if st.button("Mark as FALSE POSITIVE (should be LEGIT)", key=m["id"]+"_fp"):
+                        log_example(m["id"], display_text, prob, prob_adj, thr_low, thr_high, label, "FP")
+                        st.success("Logged as FP")
+                with cols[1]:
+                    if st.button("Mark as FALSE NEGATIVE (should be PHISHING)", key=m["id"]+"_fn"):
+                        log_example(m["id"], display_text, prob, prob_adj, thr_low, thr_high, label, "FN")
+                        st.success("Logged as FN")
+                with cols[2]:
+                    download_log_button()
+            else:
+                st.caption("Marked as SUSPICIOUS (manual review recommended).")
 
         st.divider()
