@@ -440,29 +440,31 @@ else:
         st.write(preview if preview else "(no content)")
 
         if st.button(f"Classify this #{m['id']}", key=m["id"]):
-           enc = tok(display_text, truncation=True, padding=True, max_length=384, return_tensors="pt")
+enc = tok(display_text, truncation=True, padding=True, max_length=384, return_tensors="pt")
 with torch.no_grad():
     out = mdl(**enc)
     prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
 
-       # Apply header-based trust only if enabled
-        boost = header_trust_boost(headers) if apply_header_trust else 0.0
-        prob_adj = min(max(prob + boost, 0.0), 1.0)
-        label = triage_label(prob_adj, thr_low, thr_high)
+# Apply header-based trust only if enabled
+boost = header_trust_boost(headers) if apply_header_trust else 0.0
+prob_adj = min(max(prob + boost, 0.0), 1.0)
 
-         st.info(
-                 f"{label} "
-                 f"(model_prob={prob:.3f}, prob_after_rules={prob_adj:.3f}, "
-                 f"low={thr_low:.2f}, high={thr_high:.2f}, "
-                 f"header_trust={'on' if apply_header_trust else 'off'})"
-      )
-          st.json({
-                 "model_prob": prob,
-                 "prob_after_header_rules": prob_adj,
-                 "threshold_low": thr_low,
-                 "threshold_high": thr_high,
-                 "header_trust_applied": bool(apply_header_trust),
+label = triage_label(prob_adj, thr_low, thr_high)
+
+st.info(
+    f"{label} "
+    f"(model_prob={prob:.3f}, prob_after_rules={prob_adj:.3f}, "
+    f"low={thr_low:.2f}, high={thr_high:.2f}, "
+    f"header_trust={'on' if apply_header_trust else 'off'})"
+)
+st.json({
+    "model_prob": prob,
+    "prob_after_header_rules": prob_adj,
+    "threshold_low": thr_low,
+    "threshold_high": thr_high,
+    "header_trust_applied": bool(apply_header_trust),
 })
+
 
 
             if label in ("PHISHING", "LEGIT"):
