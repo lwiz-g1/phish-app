@@ -444,7 +444,7 @@ else:
         st.write(preview if preview else "(no content)")
 
         # ---- Classify with optional header-based trust tweak ----
-        if st.button(f"Classify this #{m['id']}", key=m["id"]):
+        if st.button(f"Classify this "):
             enc = tok(display_text, truncation=True, padding=True, max_length=384, return_tensors="pt")
             with torch.no_grad():
                 out = mdl(**enc)
