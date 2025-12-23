@@ -190,6 +190,17 @@ if thr_high <= thr_low:
 st.session_state["thr_low"] = thr_low
 st.session_state["thr_high"] = thr_high
 
+# Optional header-based trust rule (SPF/DKIM + trusted domains)
+apply_header_trust = st.sidebar.checkbox(
+    "Apply header-based trust adjustment (experimental)",
+    value=True,
+    help=(
+        "If enabled, reduce probability slightly for emails that pass SPF/DKIM "
+        "and come from selected trusted domains. Disable if you want pure model scores."
+    ),
+)
+st.session_state["apply_header_trust"] = apply_header_trust
+
 if thr_low <= 0.35:
     st.sidebar.warning("High recall: fewer emails are marked LEGIT.")
 if thr_high >= 0.85:
@@ -429,21 +440,30 @@ else:
         st.write(preview if preview else "(no content)")
 
         if st.button(f"Classify this #{m['id']}", key=m["id"]):
-            enc = tok(display_text, truncation=True, padding=True, max_length=384, return_tensors="pt")
-            with torch.no_grad():
-                out = mdl(**enc)
-                prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
+           enc = tok(display_text, truncation=True, padding=True, max_length=384, return_tensors="pt")
+with torch.no_grad():
+    out = mdl(**enc)
+    prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
 
-            prob_adj = min(max(prob + header_trust_boost(headers), 0.0), 1.0)
-            label = triage_label(prob_adj, thr_low, thr_high)
+       # Apply header-based trust only if enabled
+        boost = header_trust_boost(headers) if apply_header_trust else 0.0
+        prob_adj = min(max(prob + boost, 0.0), 1.0)
+        label = triage_label(prob_adj, thr_low, thr_high)
 
-            st.info(f"{label} (model_prob={prob:.3f}, prob_after_rules={prob_adj:.3f}, low={thr_low:.2f}, high={thr_high:.2f})")
-            st.json({
-                "model_prob": prob,
-                "prob_after_header_rules": prob_adj,
-                "threshold_low": thr_low,
-                "threshold_high": thr_high,
-            })
+         st.info(
+                 f"{label} "
+                 f"(model_prob={prob:.3f}, prob_after_rules={prob_adj:.3f}, "
+                 f"low={thr_low:.2f}, high={thr_high:.2f}, "
+                 f"header_trust={'on' if apply_header_trust else 'off'})"
+      )
+          st.json({
+                 "model_prob": prob,
+                 "prob_after_header_rules": prob_adj,
+                 "threshold_low": thr_low,
+                 "threshold_high": thr_high,
+                 "header_trust_applied": bool(apply_header_trust),
+})
+
 
             if label in ("PHISHING", "LEGIT"):
                 cols = st.columns(3)
