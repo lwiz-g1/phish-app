@@ -403,9 +403,10 @@ def sign_out():
     st.success("Signed out.")
     st.stop()
 
-st.sidebar.button("Sign out / Clear session", on_click=sign_out)
+st.sidebar.button("Sign out", on_click=sign_out)
 download_log_button()
 
+# Fetch last 10 messages
 resp = service.users().messages().list(userId="me", q="newer_than:7d", maxResults=10).execute()
 msgs = resp.get("messages", [])
 if not msgs:
@@ -418,6 +419,7 @@ else:
         headers_list = payload.get("headers", []) or []
         headers = {h.get("name", ""): h.get("value", "") for h in headers_list}
 
+        # Use structured extraction
         features = extract_email_features_from_gmail_message(full)
 
         subject = features["subject"]
@@ -427,6 +429,7 @@ else:
 
         preview = (body_text[:800] + ("…" if len(body_text) > 800 else "")) if body_text else full.get("snippet", "")
 
+        # Text passed to the model
         display_text = build_model_input(
             subject=subject,
             from_=sender,
@@ -435,37 +438,37 @@ else:
             urls=urls,
         )
 
+        # UI preview
         st.write(f"**{subject}**")
         st.write(f"From: {sender}")
         st.write(preview if preview else "(no content)")
 
+        # ---- Classify with optional header-based trust tweak ----
         if st.button(f"Classify this #{m['id']}", key=m["id"]):
-enc = tok(display_text, truncation=True, padding=True, max_length=384, return_tensors="pt")
-with torch.no_grad():
-    out = mdl(**enc)
-    prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
+            enc = tok(display_text, truncation=True, padding=True, max_length=384, return_tensors="pt")
+            with torch.no_grad():
+                out = mdl(**enc)
+                prob = torch.softmax(out.logits, dim=1).numpy().ravel()[1].item()
 
-# Apply header-based trust only if enabled
-boost = header_trust_boost(headers) if apply_header_trust else 0.0
-prob_adj = min(max(prob + boost, 0.0), 1.0)
+            # Apply header-based trust only if enabled
+            boost = header_trust_boost(headers) if st.session_state.get("apply_header_trust", True) else 0.0
+            prob_adj = min(max(prob + boost, 0.0), 1.0)
 
-label = triage_label(prob_adj, thr_low, thr_high)
+            label = triage_label(prob_adj, thr_low, thr_high)
 
-st.info(
-    f"{label} "
-    f"(model_prob={prob:.3f}, prob_after_rules={prob_adj:.3f}, "
-    f"low={thr_low:.2f}, high={thr_high:.2f}, "
-    f"header_trust={'on' if apply_header_trust else 'off'})"
-)
-st.json({
-    "model_prob": prob,
-    "prob_after_header_rules": prob_adj,
-    "threshold_low": thr_low,
-    "threshold_high": thr_high,
-    "header_trust_applied": bool(apply_header_trust),
-})
-
-
+            st.info(
+                f"{label} "
+                f"(model_prob={prob:.3f}, prob_after_rules={prob_adj:.3f}, "
+                f"low={thr_low:.2f}, high={thr_high:.2f}, "
+                f"header_trust={'on' if st.session_state.get('apply_header_trust', True) else 'off'})"
+            )
+            st.json({
+                "model_prob": prob,
+                "prob_after_header_rules": prob_adj,
+                "threshold_low": thr_low,
+                "threshold_high": thr_high,
+                "header_trust_applied": bool(st.session_state.get("apply_header_trust", True)),
+            })
 
             if label in ("PHISHING", "LEGIT"):
                 cols = st.columns(3)
